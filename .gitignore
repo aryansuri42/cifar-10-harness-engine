@@ -1,0 +1,12 @@
+# secrets
+.env
+
+# environment
+.venv/
+__pycache__/
+
+# generated at runtime: dataset (~180 MB), trained models, logs, LLM output
+data/*.npz
+models/*.keras
+generated/
+Logs_examine.txt
