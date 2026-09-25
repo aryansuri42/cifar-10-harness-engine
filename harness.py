@@ -38,7 +38,9 @@ LOCAL_MODEL = "qwen2.5-coder:7b"
 MODEL = NIM_MODEL if LLM_BACKEND == "nim" else LOCAL_MODEL
 
 TARGET = 0.95             # verified test accuracy needed to pass
-MAX_GAP = 0.15            # max verified (train acc - test acc) AT the target; blocks memorised passes
+MAX_GAP = 0.15            # train - test gap above which a result is diagnosed as overfitting. Not a pass rule:
+                          # at test >= TARGET the gap is at most 1 - TARGET, and the held-out test set already
+                          # rules out a memorised pass
 MAX_ATTEMPTS = 25         # GRADED experiments; crashes and rejected scripts do not consume these
 MAX_LLM_CALLS = 60        # hard stop on generations, so a crash loop cannot run forever
 MAX_CONSECUTIVE_FAILS = 8 # give up if this many attempts in a row never reach the grader
@@ -221,7 +223,8 @@ back to you. After every result the harness names the NEXT EXPERIMENT to run. Fo
 
 WHAT SUCCESS MEANS
 - The grader loads the model file your script saves and measures accuracy on 10000 held-out test images: >= {TARGET:.2f}.
-- It also measures train accuracy. At the target, (train - test) must be <= {MAX_GAP:.2f}.
+- It also measures train accuracy, to tell underfitting (train accuracy too low) from overfitting (train - test gap
+  above {MAX_GAP:.2f}).
 - Measured in earlier runs of this loop: a plain CNN reaches 0.76-0.84, a VGG-style CNN with BatchNorm and
   Adam 0.88. That is the ceiling of tweaking. {TARGET:.2f} needs one of:
     (a) an ImageNet-pretrained backbone fine-tuned at a higher resolution - the most reliable route, about 0.96
@@ -826,13 +829,6 @@ def feedback(r):
                 f"{', '.join(r.get('save_paths') or ['models/*.keras'])}. The saved file must be a full model "
                 f"(not weights only) that loads with tf.keras.models.load_model, accepts raw 0..255 images of shape "
                 f"(N, 32, 32, 3) and outputs 10 scores.\nEpochs:\n```\n{curve}\n```")
-    elif r.get("gap", 0) > MAX_GAP and acc >= TARGET:
-        tr = r["train_acc"]
-        status = f"overfit at target (train {tr:.3f} / test {acc:.3f})"
-        body = (f"Test accuracy {acc:.4f} REACHES the {TARGET} target, but train accuracy is {tr:.4f}: a gap of "
-                f"{r['gap']:.4f}, above the allowed {MAX_GAP:.2f}, so it does not pass. Keep this accuracy and close "
-                f"the gap: stronger augmentation (cutout / mixup), label smoothing, weight decay, or stopping earlier "
-                f"on val_accuracy.\nEpochs:\n```\n{curve}\n```" + budget_note(r))
     else:
         tr, gap = r.get("train_acc"), r.get("gap", 0)
         status = f"below target ({acc:.4f})"
@@ -846,8 +842,9 @@ def feedback(r):
                          f"in a tf.data pipeline, label smoothing, weight decay. Do NOT shrink the network.")
             elif tr < TARGET:
                 status += " + underfit"
-                head += (f"Train accuracy is only {tr:.4f}, so the model cannot fit even the TRAINING data: it is too "
-                         f"small or trained too briefly, and this is NOT overfitting. Do NOT add more Dropout. Add "
+                head += (f"Train accuracy is only {tr:.4f}, below the {TARGET} target, so the model cannot fit the "
+                         f"TRAINING data well enough to pass, however well it generalises: it is too small or trained "
+                         f"too briefly (underfitting relative to the target), and this is NOT overfitting. Do NOT add more Dropout. Add "
                          f"capacity (deeper / wider, residual blocks, or an ImageNet-pretrained backbone) and train "
                          f"longer.")
             else:
@@ -907,7 +904,7 @@ def attempt_once(attempt, messages, temperature, seen):
     r["acc"], r["train_acc"], r["probe_acc"], r["claimed"] = g["acc"], g["train_acc"], g["probe_acc"], claimed
     r["gap"], r["params"], r["graded_file"] = r["train_acc"] - r["acc"], g["params"], ROOT / g["file"]
     log.info("[VERIFY] graded %s", g["file"])
-    log.info("[METRIC] test_acc=%.4f | train_acc=%.4f | gap=%.4f (max %.2f) | claimed=%s | probe(/255)=%.4f | "
+    log.info("[METRIC] test_acc=%.4f | train_acc=%.4f | gap=%.4f (overfit above %.2f) | claimed=%s | probe(/255)=%.4f | "
              "params=%s | train=%.1f min | exit=%s", r["acc"], r["train_acc"], r["gap"], MAX_GAP,
              f"{claimed:.4f}" if claimed is not None else "none", r["probe_acc"], f"{g['params']:,}",
              r["secs"] / 60, r["exit_code"])
@@ -922,7 +919,7 @@ def attempt_once(attempt, messages, temperature, seen):
 
 def main():
     prepare_data()
-    log.info("[SETUP] backend=%s model=%s task=CIFAR-10 target=%.2f max_gap=%.2f max_attempts=%d train_budget=%dmin "
+    log.info("[SETUP] backend=%s model=%s task=CIFAR-10 target=%.2f overfit_gap=%.2f max_attempts=%d train_budget=%dmin "
              "kill=%dmin total_budget=%dmin log=%s", LLM_BACKEND, MODEL, TARGET, MAX_GAP, MAX_ATTEMPTS,
              TRAIN_BUDGET_MIN, RUN_TIMEOUT // 60, TOTAL_BUDGET_MIN, log_file.name)
     base = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": TASK}]
@@ -976,9 +973,8 @@ def main():
                      attempt, acc, BEST_MODEL.relative_to(ROOT).as_posix())
         elif acc is not None:
             stall += 1
-        if acc is not None and acc >= TARGET and r["gap"] <= MAX_GAP:
-            log.info("[DECISION] test %.4f >= %.2f and gap %.4f <= %.2f -> TARGET REACHED, stopping",
-                     acc, TARGET, r["gap"], MAX_GAP)
+        if acc is not None and acc >= TARGET:
+            log.info("[DECISION] test %.4f >= %.2f (gap %.4f) -> TARGET REACHED, stopping", acc, TARGET, r["gap"])
             results.append((attempt, "PASSED", acc, r["secs"]))
             break
 
@@ -1120,9 +1116,7 @@ def selftest():
     assert feedback({"problems": [], "exit_code": 0, "eval_error": "no model file"})[0] == "grader failed: no model file"
     assert feedback({"problems": [], "exit_code": 0, "acc": 0.71, "train_acc": 0.75, "gap": 0.04,
                      "secs": 600})[0] == "below target (0.7100) + underfit"
-    # at/above target but memorised -> blocked; below target with a big gap -> regularise, never shrink
-    assert feedback({"problems": [], "exit_code": 0, "acc": 0.96, "train_acc": 0.9999,
-                     "gap": 0.16})[0].startswith("overfit at target")
+    # below target with a big gap -> regularise, never shrink
     s, b = feedback({"problems": [], "exit_code": 0, "acc": 0.84, "train_acc": 0.9999, "gap": 0.16})
     assert s == "below target (0.8400) + overfit" and "Do NOT shrink" in b, s
     # sound recipe, just not strong enough -> asks for a bigger jump, not another tweak
@@ -1177,7 +1171,7 @@ def selftest():
     assert feedback({"problems": [], "duplicate_of": 7, "duplicate_summary": "Attempt 7: x"})[0] == "duplicate of attempt 7"
     s, b = feedback({"problems": [], "exit_code": 0, "acc": 0.7655, "train_acc": 0.8392, "gap": 0.0737,
                      "probe_acc": 0.0995, "claimed": 0.7655, "secs": 126})
-    assert s == "below target (0.7655) + underfit" and "cannot fit even the TRAINING data" in b and "Compute:" in b, s
+    assert s == "below target (0.7655) + underfit" and "cannot fit the TRAINING data well enough" in b and "Compute:" in b, s
     # train 0.867 is far below the 0.95 target: capacity-limited, not memorising
     s, b = feedback({"problems": [], "exit_code": 0, "acc": 0.7607, "train_acc": 0.8673, "gap": 0.1066, "secs": 216})
     assert s == "below target (0.7607) + underfit" and "pretrained backbone" in b, s

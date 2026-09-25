@@ -23,7 +23,7 @@ and feedback specific enough to act on.
 | A changed save path / custom loss breaks grading | For every script the harness writes `generated/grader_N.py`, synced to the path(s) the script saves to (constants, f-strings, `{epoch}` patterns, `os.path.join`) and able to load its own helpers (`compile=False`). The LLM never writes the grader. |
 | A 7B model crashes when writing infrastructure from memory | The prompt carries a tested reference script (tf.data crop/flip/cutout/mixup, mixed precision, AdamW + warmup-cosine, label smoothing, time limit); the model edits `build_model()` and CONFIG, using tested building blocks (ResNet block, pretrained EfficientNetV2). |
 | A 7B model can't plan research | The harness picks ONE next experiment from the results (pretrained backbone → ResNet-18 → 224px → mixup, max 2 requests each) and flags a script that skips it. |
-| A memorised model "passes" | Train accuracy is measured too; the train−test gap must stay within `MAX_GAP` at the target. |
+| A memorised model "passes" | It can't: only accuracy on the 10k held-out test images counts, measured by the grader. Train accuracy is measured too, to tell underfitting from overfitting. |
 | Wasted GPU time on code that cannot work | Static checks before running: syntax, undefined names, **use before definition**, pixel scaling outside the model, test-set leakage, wrong checkpoint path, missing `Rescaling`, known API traps. |
 | "Below target" tells the model nothing | Diagnoses **not learning** (train accuracy at chance = pipeline bug), **pre-scaled input**, **underfitting** vs **overfitting**, unused compute budget, and a PLAN that promises augmentation the code lacks. |
 | The model re-submits the same script | Scripts are compared with comments and whitespace stripped; a duplicate is never trained. |
@@ -37,9 +37,9 @@ and feedback specific enough to act on.
 |---|---|---|
 | 1 | basic loop | 0.10 — every script scaled pixels three times, so the model never learned |
 | 2 | scaling check, overfit gap, short context | 0.7731 — but 7 of 10 attempts re-ran identical code |
-| 3 | duplicate detection, best-so-far anchor, plateau notice | 0.8759 — 13 of 25 attempts crashed at high temperature |
+| 3 | duplicate detection, best-so-far anchor, plateau notice | 0.8759 — 15 of 25 attempts crashed at high temperature |
 | 4 | temperature cap, NameError checks, crash budget | pending |
-| 5 | reference script, grader synced per script, harness-chosen next experiment, s/epoch feedback, Ollama unloaded during training | pending |
+| 5 | reference script, grader synced per script, harness-chosen next experiment, s/epoch feedback, Ollama unloaded during training | **0.9758** — passed on attempt 4 of 4 in 30 min, 0 crashes (pretrained EfficientNetV2B0, train−test gap 0.024) |
 
 MNIST, the warm-up task, passes on the first attempt at **0.9916**.
 
@@ -80,7 +80,7 @@ All at the top of `harness.py`:
 | Setting | Default | Meaning |
 |---|---|---|
 | `TARGET` | `0.95` | verified test accuracy needed to pass |
-| `MAX_GAP` | `0.15` | largest train−test gap allowed at the target |
+| `MAX_GAP` | `0.15` | train−test gap above which a result is diagnosed as overfitting (feedback only, not a pass rule) |
 | `MAX_ATTEMPTS` | `25` | **graded** experiments; crashes do not count |
 | `MAX_LLM_CALLS` / `MAX_CONSECUTIVE_FAILS` | `60` / `8` | hard stops for crash loops |
 | `MAX_TEMPERATURE` | `0.7` | above this a 7B model writes broken code instead of new ideas |
@@ -97,14 +97,16 @@ All at the top of `harness.py`:
 writes before the code. `[METRIC]` is the line that matters:
 
 ```
-[METRIC] test_acc=0.8759 | train_acc=0.9944 | gap=0.1185 (max 0.15) | claimed=0.8759 | probe(/255)=0.0995 | params=4,698,186 | train=24.5 min | exit=0
+[METRIC] test_acc=0.8759 | train_acc=0.9944 | gap=0.1185 (overfit above 0.15) | claimed=0.8759 | probe(/255)=0.0995 | params=4,698,186 | train=24.5 min | exit=0
 ```
 
 ## Notes and limitations
 
 - Generated code runs as a plain subprocess with a timeout — fine on your own machine or a disposable Colab VM,
   but it is **not a sandbox**.
-- `MAX_GAP` is checked at the target, so it never blocks progress at lower accuracy.
+- `MAX_GAP` only drives the overfitting diagnosis. It can't be a pass rule: at 0.95 test accuracy the gap is at most 0.05.
+- "Underfit" means train accuracy is below the target, i.e. underfitting *relative to the target*: the model can't pass
+  however well it generalises, so the fix is capacity or training time, not Dropout.
 - The 95% target is deliberately out of easy reach: a plain CNN plateaus near 0.78, so the loop has to find
   residual networks, strong augmentation or a pretrained backbone.
 - `harness.py --selftest` covers extraction, every static check, the diagnoses and the feedback branches, with
