@@ -19,7 +19,10 @@ and feedback specific enough to act on.
 
 | Problem it solves | How |
 |---|---|
-| The script can report any accuracy it likes | The grader loads `models/cifar10_cnn.keras` itself and scores 10k test images. The printed number is only cross-checked; mismatches are reported. |
+| The script can report any accuracy it likes | The grader loads the saved model itself and scores 10k test images. The printed number is only cross-checked; mismatches are reported. |
+| A changed save path / custom loss breaks grading | For every script the harness writes `generated/grader_N.py`, synced to the path(s) the script saves to (constants, f-strings, `{epoch}` patterns, `os.path.join`) and able to load its own helpers (`compile=False`). The LLM never writes the grader. |
+| A 7B model crashes when writing infrastructure from memory | The prompt carries a tested reference script (tf.data crop/flip/cutout/mixup, mixed precision, AdamW + warmup-cosine, label smoothing, time limit); the model edits `build_model()` and CONFIG, using tested building blocks (ResNet block, pretrained EfficientNetV2). |
+| A 7B model can't plan research | The harness picks ONE next experiment from the results (pretrained backbone → ResNet-18 → 224px → mixup, max 2 requests each) and flags a script that skips it. |
 | A memorised model "passes" | Train accuracy is measured too; the train−test gap must stay within `MAX_GAP` at the target. |
 | Wasted GPU time on code that cannot work | Static checks before running: syntax, undefined names, **use before definition**, pixel scaling outside the model, test-set leakage, wrong checkpoint path, missing `Rescaling`, known API traps. |
 | "Below target" tells the model nothing | Diagnoses **not learning** (train accuracy at chance = pipeline bug), **pre-scaled input**, **underfitting** vs **overfitting**, unused compute budget, and a PLAN that promises augmentation the code lacks. |
@@ -36,6 +39,7 @@ and feedback specific enough to act on.
 | 2 | scaling check, overfit gap, short context | 0.7731 — but 7 of 10 attempts re-ran identical code |
 | 3 | duplicate detection, best-so-far anchor, plateau notice | 0.8759 — 13 of 25 attempts crashed at high temperature |
 | 4 | temperature cap, NameError checks, crash budget | pending |
+| 5 | reference script, grader synced per script, harness-chosen next experiment, s/epoch feedback, Ollama unloaded during training | pending |
 
 MNIST, the warm-up task, passes on the first attempt at **0.9916**.
 
@@ -47,7 +51,8 @@ MNIST, the warm-up task, passes on the first attempt at **0.9916**.
 | `harness_colab.ipynb` | The same logic as a Colab notebook, one cell per step, with a local Qwen served by Ollama. **Generated** — do not edit by hand. |
 | `build_notebook.py` | Builds the notebook from `harness.py` by copying the shared functions, so the two never drift apart. |
 | `generated/attempt_N.py` | What the LLM wrote on each attempt; `best.py` is the best-scoring one. |
-| `models/cifar10_cnn.keras` | The checkpoint the grader reads; `best.keras` is the best model across attempts. |
+| `generated/grader_N.py` | The grader the harness wrote for attempt N (which file it grades, which helpers it loads). |
+| `models/cifar10_cnn.keras` | Default checkpoint path (the grader follows whatever the script uses); `best.keras` is the best model across attempts. |
 | `logs/run_<timestamp>.log` | Full log: prompts, the model's reasoning, generated code, training output, metrics, decisions. |
 | `data/cifar10_split.npz` | CIFAR-10 pre-split into train 45k / val 5k / test 10k, built once from the Hugging Face mirror. |
 
@@ -85,8 +90,9 @@ All at the top of `harness.py`:
 
 ## Log tags
 
-`[SETUP] [DATA] [ATTEMPT] [PROMPT] [THINK] [LLM] [EXTRACT] [CODE] [CHECK] [EXEC] [VERIFY] [METRIC] [DECISION] [REPORT]`
+`[SETUP] [DATA] [ATTEMPT] [PROMPT] [THINK] [LLM] [EXTRACT] [CODE] [CHECK] [GRADER] [EXEC] [VERIFY] [METRIC] [DECISION] [REPORT]`
 
+`[GRADER]` shows which file each attempt's grader reads, and `save path changed: ... -> ...` when a script moves it.
 `[THINK]` is the model's own reasoning: a native reasoning stream when the model has one, otherwise the PLAN it
 writes before the code. `[METRIC]` is the line that matters:
 

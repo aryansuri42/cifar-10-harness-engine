@@ -38,12 +38,13 @@ md(r"""
 
 **How it works**
 ```
-prompt ─► Qwen2.5-Coder-7B (local, Ollama) ─► attempt_N.py ─► static checks ─► run (subprocess, timeout)
-   ▲                                                                                │
-   └── feedback: root cause + epoch curve + lessons ◄── grader scores the saved model itself
+prompt + reference script ─► Qwen2.5-Coder-7B (Ollama) ─► attempt_N.py ─► static checks ─► grader_N.py synced to it
+   ▲                                                                                              │
+   │                                                                              run (subprocess, timeout)
+   └── feedback: root cause + epoch curve + s/epoch + ONE next experiment ◄── grader scores the saved model itself
 ```
 The LLM runs **on this Colab GPU**, no API key needed. The harness never trusts the accuracy the script prints:
-it loads `models/cifar10_cnn.keras` itself and grades it.
+for every script it writes `generated/grader_N.py`, pointed at the file that script saves, and grades it.
 
 **Setup**
 1. Runtime → Change runtime type → **T4 GPU** (required: the 7B model needs ~5 GB of GPU memory)
@@ -52,7 +53,7 @@ it loads `models/cifar10_cnn.keras` itself and grades it.
 Optional: set `LLM_BACKEND = "nim"` in Step 1 to use NVIDIA NIM instead (needs a Colab secret `NVIDIA_KEY`,
 🔑 icon in the left sidebar, with notebook access on).
 
-**Log tags:** `[SETUP] [DATA] [ATTEMPT] [PROMPT] [THINK] [LLM] [EXTRACT] [CODE] [CHECK] [EXEC] [VERIFY] [METRIC] [DECISION] [REPORT]`
+**Log tags:** `[SETUP] [DATA] [ATTEMPT] [PROMPT] [THINK] [LLM] [EXTRACT] [CODE] [CHECK] [GRADER] [EXEC] [VERIFY] [METRIC] [DECISION] [REPORT]`
 
 *Generated from `harness.py` by `build_notebook.py`: edit those, not this notebook.*
 """)
@@ -87,7 +88,7 @@ for d in (LOG_DIR, GEN_DIR, MODEL_FILE.parent, DATA_FILE.parent):
 
 md("## Step 2 — Logging (console + `logs/run_<timestamp>.log`)")
 code(r"""
-import ast, builtins, io, json, logging, re, shutil, subprocess, symtable, sys, threading, time, urllib.request
+import ast, builtins, glob, io, json, logging, re, shutil, subprocess, symtable, sys, threading, time, urllib.request
 
 log_file = LOG_DIR / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log"
 logging.basicConfig(
@@ -126,8 +127,9 @@ if LLM_BACKEND == "local":
 
     !apt-get -qq install -y zstd > /dev/null
     !curl -fsSL https://ollama.com/install.sh | sh > /dev/null 2>&1
-    # keep_alive=-1: model stays in GPU memory between attempts (~5 GB; the CNN gets the rest)
-    ollama_env = {**os.environ, "OLLAMA_CONTEXT_LENGTH": str(LLM_CONTEXT), "OLLAMA_KEEP_ALIVE": "-1"}
+    # keep_alive=0: unload Qwen right after each answer, so training gets the whole T4 instead of ~10 GB
+    # (a pretrained backbone at 160-224px needs it). Reloading from the page cache costs ~5-10 s per attempt.
+    ollama_env = {**os.environ, "OLLAMA_CONTEXT_LENGTH": str(LLM_CONTEXT), "OLLAMA_KEEP_ALIVE": "0"}
     ollama_proc = subprocess.Popen(["ollama", "serve"], env=ollama_env,
                                    stdout=open(LOG_DIR / "ollama.log", "w"), stderr=subprocess.STDOUT)
     if not wait_for("http://localhost:11434"):
@@ -149,9 +151,12 @@ else:
 
 md(r"""
 ## Step 4 — The task prompt
-Requirements only, no architecture hints: we want to see what the model comes up with.
+A 7B model is a decent editor and a poor author, so the prompt carries a **known-good reference script** (tf.data
+with crop/flip/cutout/mixup, mixed precision, AdamW + warmup-cosine, label smoothing, checkpoint, time limit).
+The model changes `build_model()` and the CONFIG values, using tested building blocks (ResNet block, pretrained
+EfficientNetV2) instead of writing the infrastructure from memory, which is where most of its scripts crashed.
 """)
-code(src("SYSTEM", "TASK") + "\nprint(TASK)")
+code(src("SYSTEM", "SCAFFOLD", "TASK") + "\nprint(TASK)")
 
 md(r"""
 ## Step 5 — LLM client
@@ -171,7 +176,7 @@ ask_llm([{"role": "user", "content": "Reply with exactly: OK"}], max_tokens=300)
 
 md("## Step 6 — Extract the code + cheap static checks (before spending minutes running it)")
 code(src("extract_code", "undefined_names", "_loads", "_binds", "use_before_definition",
-         "check_code", "normalize", "generate"))
+         "_str", "model_paths", "SELF_RESCALING", "check_code", "normalize", "generate"))
 
 md(r"""
 ## Step 7 — Dataset: build `data/cifar10_split.npz` once
@@ -187,11 +192,13 @@ md(r"""
 code(src("TF_ENV", "run_script", "parse_accuracy"))
 
 md(r"""
-## Step 9 — Grader: the harness scores the saved model itself
-Test accuracy, train accuracy (overfitting gap) and a /255 probe, measured by the harness, not read from the
-script's logs. Runs in a subprocess so TensorFlow never grabs GPU memory inside this notebook.
+## Step 9 — Grader, re-synced to every script
+Before each run the harness writes `generated/grader_N.py` for that script: it grades the file the script
+actually saves (any name, `{epoch}` patterns, `.h5`), loads with `compile=False` and the script's own
+functions/classes, so a renamed checkpoint or a custom loss no longer breaks grading. The measurement itself
+(test accuracy, train accuracy for the overfitting gap, /255 probe) never comes from the LLM.
 """)
-code(src("GRADER", "verify_model"))
+code(src("GRADER", "sync_grader", "verify_model"))
 
 md(r"""
 ## Step 10 — Diagnosis + feedback: turn each result into a message the LLM can act on
@@ -199,12 +206,14 @@ md(r"""
 - **Underfit vs overfit:** a small gap with low train accuracy means the network is too small: the fix is *more*
   capacity, not more Dropout. Overfit advice leads with data augmentation and never says "shrink" while test
   accuracy is still below target.
-- **Budget:** says how much of the compute budget went unused.
-- **Plan ≠ code:** flags a PLAN that promises augmentation the script doesn't contain.
+- **Budget:** measured seconds per epoch and how many epochs fit, plus how much of the budget went unused.
+- **Next experiment:** the harness, not the 7B model, picks the research direction: pretrained backbone →
+  ResNet-18 (if not pretrained) → 224px (if pretrained) → mixup, each asked for at most twice.
+- **Plan ≠ code:** flags a script that skips the requested experiment, or a PLAN promising augmentation it lacks.
 - The model sees the epoch curve (first 3 + last 5 epochs) with warning noise filtered out.
 """)
 code(src("NOISE", "clean", "epoch_curve", "error_line", "diagnose", "AUG", "TECHNIQUES", "techniques",
-         "budget_note", "feedback"))
+         "MOVES", "next_move", "epoch_seconds", "budget_note", "feedback"))
 
 md("## Step 11 — Self-test (no API calls)")
 code(src("selftest") + "\n\nselftest()")
@@ -213,8 +222,11 @@ md(r"""
 ## Step 12 — The loop
 - A crashed run is still graded if its checkpoint exists.
 - **Identical scripts are never re-trained:** a duplicate is sent straight back with "make a substantive change".
-- **Stuck → more exploration:** temperature rises 0.2 → 0.5 → 0.8 → 1.0 with each attempt that doesn't beat the
-  best, and after 2 such attempts the prompt opens with a PLATEAU notice asking for a structural change.
+- **Stuck → more exploration:** temperature rises 0.2 → 0.4 → 0.6 → 0.7 (cap) with each attempt that doesn't beat
+  the best, and drops back to 0.2 after broken code. Once the harness's experiment list is used up, 2 attempts
+  without a new best trigger a PLATEAU notice asking for a structural change.
+- **Grader follows the script:** when a script changes its save path, `[GRADER] save path changed` is logged and
+  that attempt's grader reads the new file.
 - **Best-so-far is kept:** `models/best.keras` + `generated/best.py`, even if the target is never reached.
 - Short context: the task + only the last attempt + a one-line lesson (with test/train/params) per attempt.
 """)

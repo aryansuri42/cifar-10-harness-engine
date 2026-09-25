@@ -2,12 +2,14 @@
 Local twin of harness_colab.ipynb (same logic, same log tags).
 
 Step 1: LLM client (NVIDIA NIM, or a local Ollama server) + logging.
-Step 2: prompt -> generated code -> extract -> static checks -> save.
-Step 3: run the script in a subprocess, stream its output into the log, hard timeout.
-Step 4: VERIFY: the harness loads the saved model itself (in a subprocess) and measures test accuracy, train
+Step 2: prompt (task + known-good reference script) -> generated code -> extract -> static checks -> save.
+Step 3: sync the grader to the script (generated/grader_N.py: the model path it saves to, its helpers), then run
+        the script in a subprocess, stream its output into the log, hard timeout.
+Step 4: VERIFY: the synced grader loads the saved model itself (in a subprocess) and measures test accuracy, train
         accuracy (overfitting gap) and a /255 probe. The script's own printed accuracy is only cross-checked.
 Step 5: diagnose + feedback -> the LLM gets the root cause (crash / timeout / OOM / not learning / scaling bug /
-        overfit / low accuracy) plus the epoch curve, and a one-line lesson per earlier attempt. Retry.
+        overfit / low accuracy), the epoch curve, seconds per epoch, a one-line lesson per earlier attempt and
+        ONE next experiment chosen by the harness (pretrained backbone, ResNet, 224px, mixup). Retry.
 Step 6: final report.
 
 Usage:  python harness.py              run the loop
@@ -15,6 +17,7 @@ Usage:  python harness.py              run the loop
 """
 import ast
 import builtins
+import glob
 import io
 import json
 import logging
@@ -68,82 +71,204 @@ log = logging.getLogger("harness")
 # ---------------------------------------------------------------- prompt
 
 SYSTEM = (
-    "You are a machine-learning researcher who iterates empirically, not a tutorial writer. Each turn you receive "
-    "measurements from your previous script (verified test and train accuracy, the epoch curve, the time used, the "
-    "techniques already tried) and you run the next experiment.\n"
+    "You are a machine-learning engineer running experiments, not a tutorial writer. Each turn you receive "
+    "measurements from your previous script (verified test and train accuracy, the epoch curve, seconds per epoch) "
+    "and usually a NEXT EXPERIMENT chosen by the harness. Run exactly that experiment.\n"
     "Answer in exactly this shape:\n"
     "  Root cause: what the numbers say about the last script - one or two sentences, referring to specific values.\n"
-    "  Hypothesis: the ONE thing that is limiting accuracy now, and why.\n"
-    "  Change: what you are changing, how big the change is, and how many accuracy points you expect from it.\n"
-    "  Budget: how many epochs and roughly how many minutes that will take.\n"
+    "  Change: the experiment you are running, which functions / CONFIG values change, and the expected gain.\n"
+    "  Budget: EPOCHS x seconds per epoch = minutes, within the time limit.\n"
     "Then one complete, runnable Python script in a single ```python code block, and nothing after it.\n"
-    "Write the code your plan describes: if the plan says augmentation, the script must contain augmentation layers.")
+    "Edit the script you are shown: keep its data pipeline, callbacks and final evaluation, change build_model() "
+    "and the CONFIG values. Rewriting working infrastructure from memory is how scripts crash.")
+
+# Known-good starting point. A 7B model is a decent editor and a poor author: every from-scratch script in the
+# Qwen logs re-invented the pipeline and ~half of them crashed (Add() shape mismatch, NameError, label_smoothing on
+# a sparse loss). Given this, the model only has to change build_model() and the CONFIG block.
+SCAFFOLD = r'''import os
+import time
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers
+
+# ---------------- CONFIG: the knobs to change between experiments
+EPOCHS = 30              # keep EPOCHS x seconds-per-epoch under TIME_LIMIT_MIN
+BATCH = 128
+LR = 2e-3                # peak learning rate (AdamW, 5% linear warmup, then cosine decay to 0)
+WEIGHT_DECAY = 0.05
+LABEL_SMOOTHING = 0.1
+CUTOUT = 8               # side of the square erased from each training image, 0 = off
+MIXUP = 0.0              # mixup alpha, e.g. 0.2; 0 = off
+TIME_LIMIT_MIN = __TIME_LIMIT__      # training stops before this, whatever EPOCHS says
+MODEL_PATH = "models/cifar10_cnn.keras"
+
+if tf.config.list_physical_devices("GPU"):
+    tf.keras.mixed_precision.set_global_policy("mixed_float16")
+
+
+def conv_bn(x, filters, stride=1):
+    x = layers.Conv2D(filters, 3, strides=stride, padding="same", use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    return layers.Activation("relu")(x)
+
+
+def res_block(x, filters, stride=1):
+    """Two 3x3 convs plus a shortcut; a 1x1 conv on the shortcut whenever the shape changes."""
+    y = conv_bn(x, filters, stride)
+    y = layers.Conv2D(filters, 3, padding="same", use_bias=False)(y)
+    y = layers.BatchNormalization()(y)
+    if stride != 1 or x.shape[-1] != filters:
+        x = layers.Conv2D(filters, 1, strides=stride, use_bias=False)(x)
+        x = layers.BatchNormalization()(x)
+    return layers.Activation("relu")(layers.Add()([x, y]))
+
+
+def build_model():
+    inputs = tf.keras.Input(shape=(32, 32, 3))       # raw 0..255 pixels
+    x = layers.Rescaling(1.0 / 255)(inputs)
+    x = conv_bn(x, 64)
+    x = layers.MaxPooling2D()(x)
+    x = conv_bn(x, 128)
+    x = layers.MaxPooling2D()(x)
+    x = conv_bn(x, 256)
+    x = layers.GlobalAveragePooling2D()(x)
+    outputs = layers.Dense(10, activation="softmax", dtype="float32")(x)
+    return tf.keras.Model(inputs, outputs)
+
+
+def augment(x, y):
+    """One uint8 training image: pad 4 + random crop, horizontal flip, cutout."""
+    x = tf.image.resize_with_crop_or_pad(x, 40, 40)
+    x = tf.image.random_crop(x, [32, 32, 3])
+    x = tf.image.random_flip_left_right(x)
+    if CUTOUT:
+        cy = tf.random.uniform([], 0, 32, tf.int32)
+        cx = tf.random.uniform([], 0, 32, tf.int32)
+        rows, cols = tf.range(32)[:, None], tf.range(32)[None, :]
+        hole = (tf.abs(rows - cy) < CUTOUT // 2 + 1) & (tf.abs(cols - cx) < CUTOUT // 2 + 1)
+        x = tf.where(hole[..., None], tf.zeros_like(x), x)
+    return x, y
+
+
+def to_float(x, y):
+    return tf.cast(x, tf.float32), tf.one_hot(y, 10)   # pixels stay 0..255: scaling happens inside the model
+
+
+def mixup(x, y):
+    """One batch: blend every image and its one-hot label with another image of the same batch."""
+    g1, g2 = tf.random.gamma([], MIXUP), tf.random.gamma([], MIXUP)
+    lam = g1 / (g1 + g2)
+    idx = tf.random.shuffle(tf.range(tf.shape(x)[0]))
+    return lam * x + (1 - lam) * tf.gather(x, idx), lam * y + (1 - lam) * tf.gather(y, idx)
+
+
+class TimeLimit(tf.keras.callbacks.Callback):
+    """Stops training when the next epoch would not finish inside TIME_LIMIT_MIN."""
+    def on_train_begin(self, logs=None):
+        self.end = time.time() + TIME_LIMIT_MIN * 60
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self.t0 = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        if time.time() + (time.time() - self.t0) > self.end:
+            print(f"time limit reached after epoch {epoch + 1}")
+            self.model.stop_training = True
+
+
+def main():
+    d = np.load("data/cifar10_split.npz")
+    x_train, y_train = d["x_train"], d["y_train"]
+    x_val, y_val = d["x_val"], d["y_val"]
+    x_test, y_test = d["x_test"], d["y_test"]          # final evaluation only
+
+    auto = tf.data.AUTOTUNE
+    train = (tf.data.Dataset.from_tensor_slices((x_train, y_train)).shuffle(len(x_train))
+             .map(augment, num_parallel_calls=auto).map(to_float, num_parallel_calls=auto)
+             .batch(BATCH, drop_remainder=True))
+    if MIXUP:
+        train = train.map(mixup, num_parallel_calls=auto)
+    train = train.prefetch(auto)
+    val = tf.data.Dataset.from_tensor_slices((x_val, y_val)).map(to_float).batch(256).prefetch(auto)
+
+    model = build_model()
+    steps = EPOCHS * (len(x_train) // BATCH)
+    schedule = tf.keras.optimizers.schedules.CosineDecay(
+        0.0, decay_steps=steps - steps // 20, warmup_target=LR, warmup_steps=steps // 20)
+    model.compile(optimizer=tf.keras.optimizers.AdamW(schedule, weight_decay=WEIGHT_DECAY),
+                  loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
+                  metrics=["accuracy"])
+    print(f"params: {model.count_params():,}")
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    model.fit(train, epochs=EPOCHS, validation_data=val, verbose=2, callbacks=[
+        tf.keras.callbacks.ModelCheckpoint(MODEL_PATH, monitor="val_accuracy", save_best_only=True),
+        TimeLimit()])
+
+    best = tf.keras.models.load_model(MODEL_PATH, compile=False)   # the checkpoint the grader will read
+    probs = best.predict(x_test.astype("float32"), batch_size=200, verbose=0)
+    print(f"FINAL_TEST_ACCURACY={np.mean(probs.argmax(1) == y_test):.4f}")
+
+
+if __name__ == "__main__":
+    main()
+'''.replace("__TIME_LIMIT__", str(TRAIN_BUDGET_MIN - 5))
 
 TASK = f"""Train a convolutional neural network on CIFAR-10 and reach {TARGET:.0%} test accuracy.
 
-This is a research loop, not a one-shot exercise: you get up to {MAX_ATTEMPTS} attempts, each one measured by an
-independent grader, and each result comes back to you. Treat every script as an experiment.
+This is a research loop: up to {MAX_ATTEMPTS} experiments, each graded by an independent grader, each result sent
+back to you. After every result the harness names the NEXT EXPERIMENT to run. Follow it.
 
 WHAT SUCCESS MEANS
-- The grader loads your saved model and measures accuracy on 10000 held-out test images: it must be >= {TARGET:.2f}.
-- It also measures accuracy on training images. At the target, (train - test) must be <= {MAX_GAP:.2f}, so a model
-  that memorises the training set does not pass.
-- A plain 2-3 conv-layer CNN plateaus around 0.75-0.80 no matter how you tune it. Reaching {TARGET:.0%} needs a
-  fundamentally stronger approach, and you are expected to search for one.
+- The grader loads the model file your script saves and measures accuracy on 10000 held-out test images: >= {TARGET:.2f}.
+- It also measures train accuracy. At the target, (train - test) must be <= {MAX_GAP:.2f}.
+- Measured in earlier runs of this loop: a plain CNN reaches 0.76-0.84, a VGG-style CNN with BatchNorm and
+  Adam 0.88. That is the ceiling of tweaking. {TARGET:.2f} needs one of:
+    (a) an ImageNet-pretrained backbone fine-tuned at a higher resolution - the most reliable route, about 0.96
+        in 10-15 epochs;
+    (b) a ResNet-18-style network with crop + flip + cutout, a cosine schedule and 40+ epochs - about 0.94-0.95.
 
-HARD CONSTRAINTS (checked before your script is run; violations are rejected without training)
-1. TensorFlow 2.x / tf.keras only. No PyTorch, no other frameworks.
-2. Data comes ONLY from the local file "data/cifar10_split.npz", already split, used exactly as-is:
-     d = np.load("data/cifar10_split.npz")
-     x_train, y_train = d["x_train"], d["y_train"]   # 45000 images
-     x_val,   y_val   = d["x_val"],   d["y_val"]     # 5000 images, for validation
-     x_test,  y_test  = d["x_test"],  d["y_test"]    # 10000 images, final evaluation ONLY
-   x_* are uint8 (N, 32, 32, 3) with pixels 0..255; y_* are int64 (N,) labels. Do not download anything.
-3. ALL pixel preprocessing happens INSIDE the model, starting with one tf.keras.layers.Rescaling (or a
-   Normalization layer). Feed the RAW uint8 arrays to fit/evaluate. Any "/ 255" outside the model is rejected:
-   the grader calls model.predict(x_test) on raw 0..255 pixels, so a model expecting pre-scaled input scores 10%.
-4. Validate with validation_data=(x_val, y_val). NEVER touch x_test / y_test for training, validation, early
-   stopping or checkpoint selection - only for the single final evaluation.
-5. Save DURING training so a crash never loses the model, to EXACTLY this path - the grader reads this one file
-   and nothing else, whatever your architecture is called:
-     tf.keras.callbacks.ModelCheckpoint("models/cifar10_cnn.keras", monitor="val_accuracy", save_best_only=True)
-   Do not rename it (not cifar10_resnet.keras, not best_model.keras) and do not overwrite it after training.
-   Create the models directory first.
-6. Print one line per epoch (model.fit(..., verbose=2)), no per-batch progress bars.
-7. The LAST printed line must be exactly: FINAL_TEST_ACCURACY=<float 0..1, 4 decimals>, e.g. FINAL_TEST_ACCURACY=0.9512
-8. Guard the entry point with if __name__ == "__main__":
-9. The saved model must load with tf.keras.models.load_model and use built-in Keras layers only: no Lambda layers
-   and no custom Layer/Model subclasses. (Custom Callbacks are fine - they are not part of the saved model.)
-10. Training must finish within {TRAIN_BUDGET_MIN} minutes; the process is killed at {RUN_TIMEOUT // 60} minutes.
-    A GPU may or may not be available - the script must work either way.
+START FROM THIS REFERENCE SCRIPT
+It runs as-is and meets every hard constraint. It already has a fast tf.data pipeline (random crop, flip, cutout,
+optional mixup), mixed precision on GPU, AdamW with warmup + cosine decay, label smoothing, a checkpoint and a
+time limit. Its build_model() is only a small baseline: replace it, and change the CONFIG values.
 
-WHAT YOU ARE FREE TO DO - use it
-Everything below is allowed and encouraged. Do not stay with the textbook Conv-Pool-Conv-Pool-Dense model.
-- Architecture: any depth and width; residual / skip connections built with the functional API (layers.Add);
-  bottleneck or wide-residual blocks; separable or dilated convolutions; squeeze-and-excitation; strided convs
-  instead of pooling; GlobalAveragePooling2D instead of Flatten; a small stem followed by 3-4 stages.
-- Transfer learning: tf.keras.applications backbones with weights="imagenet" (internet is available). Put a
-  tf.keras.layers.Resizing inside the model to bring 32x32 up to the backbone's size, keep Rescaling/Normalization
-  inside the model too, and fine-tune the upper blocks. This is usually the fastest route past 0.90.
-- Augmentation inside the model: RandomFlip("horizontal"), RandomTranslation, RandomZoom, RandomRotation,
-  RandomContrast, RandomCrop after padding. Stronger schemes (cutout, mixup, cutmix) may be done in a tf.data
-  pipeline on the training set - but never change what the model itself expects at inference.
-- Training recipe: SGD with momentum/nesterov or AdamW; cosine decay, warmup, one-cycle or ReduceLROnPlateau;
-  label smoothing; weight decay; gradient clipping; batch sizes from 64 to 512; 50-200 epochs if time allows.
-- Speed: tf.data with cache().shuffle().batch().prefetch(), and mixed precision
-  (tf.keras.mixed_precision.set_global_policy("mixed_float16")) on GPU - if you use it, give the final Dense
-  layer dtype="float32". Faster epochs mean more epochs inside the budget.
-- Time control: a small custom Callback that stops training when the budget is nearly spent is a good idea.
+```python
+""" + SCAFFOLD + f"""```
 
-HOW TO ITERATE
-- Read the numbers you are given before changing anything: train vs test accuracy says overfitting or
-  underfitting; the epoch curve says whether learning stalled, diverged, or was still improving when it stopped;
-  the time used says how much room is left.
-- Make each change big enough to move accuracy by at least a point. Renaming, reformatting or re-tuning one
-  hyper-parameter by 10% is a wasted attempt.
-- Use the budget: if the last run took 5 of {TRAIN_BUDGET_MIN} minutes, train much longer or much bigger.
-- Build on the best script so far. Do not fall back to a smaller model that already scored worse.
-- If a family of changes has failed twice, switch family: architecture -> training recipe -> transfer learning.
+BUILDING BLOCKS - correct and tested, copy them rather than writing your own
+- ResNet-18 style, with res_block and conv_bn from the reference script:
+      x = layers.Rescaling(1.0 / 255)(inputs)
+      x = conv_bn(x, 64)
+      for filters, stride in [(64, 1), (64, 1), (128, 2), (128, 1), (256, 2), (256, 1), (512, 2), (512, 1)]:
+          x = res_block(x, filters, stride)
+      x = layers.GlobalAveragePooling2D()(x)
+- Pretrained backbone. EfficientNetV2 rescales raw 0..255 pixels itself, so NO Rescaling layer in front of it:
+      IMG = 160                     # 224 is more accurate and about 2x slower per epoch
+      def build_model():
+          inputs = tf.keras.Input(shape=(32, 32, 3))
+          x = layers.Resizing(IMG, IMG)(inputs)
+          base = tf.keras.applications.EfficientNetV2B0(include_top=False, weights="imagenet",
+                                                        input_shape=(IMG, IMG, 3), pooling="avg")
+          x = base(x)
+          x = layers.Dropout(0.3)(x)
+          outputs = layers.Dense(10, activation="softmax", dtype="float32")(x)
+          return tf.keras.Model(inputs, outputs)
+  Fine-tune everything with LR = 5e-4, BATCH = 64, EPOCHS = 10-15. Downloading the ImageNet weights is allowed.
+
+HARD CONSTRAINTS (checked before your script runs; violations are rejected without training)
+1. TensorFlow / tf.keras only.
+2. Data comes only from "data/cifar10_split.npz", loaded as in the reference script: x_* are uint8
+   (N, 32, 32, 3), y_* int64 (N,). Train on x_train, validate on x_val. x_test / y_test only for the final line.
+3. The saved model takes RAW 0..255 pixels: the grader calls model.predict on float32 0..255 images of shape
+   (N, 32, 32, 3). All scaling happens inside the model. Any "/ 255" outside the model is rejected.
+4. Save the full model (not weights only) to a .keras file with ModelCheckpoint during training. The harness
+   reads the path from your script and grades that file.
+5. model.fit(..., verbose=2). The LAST printed line is FINAL_TEST_ACCURACY=<float 0..1, 4 decimals>.
+6. Built-in Keras layers only: no Lambda layers, no custom Layer / Model subclasses. Custom callbacks are fine.
+7. Guard the entry point with if __name__ == "__main__":
+8. Training must end within {TRAIN_BUDGET_MIN} minutes (killed at {RUN_TIMEOUT // 60}). The harness tells you the seconds
+   per epoch after each run: set EPOCHS so that EPOCHS x seconds stays under {TRAIN_BUDGET_MIN - 5} minutes.
 
 Return your reasoning in the required shape, then the full script in a single ```python code block."""
 
@@ -169,7 +294,10 @@ def ask_llm(messages, max_tokens=8192, temperature=0.2):
     otherwise the PLAN text written before the code block (Qwen)."""
     log.info("[PROMPT] (temperature %.1f) %s", temperature, messages[-1]["content"][:1500])
     t0 = time.time()
-    resp = client.chat.completions.create(model=MODEL, messages=messages, temperature=temperature, max_tokens=max_tokens)
+    # top_p 0.8 is Qwen2.5-Coder's own recommended setting: trims the unlikely tokens that turn into typos
+    extra = {"top_p": 0.8} if LLM_BACKEND == "local" else {}
+    resp = client.chat.completions.create(model=MODEL, messages=messages, temperature=temperature,
+                                          max_tokens=max_tokens, **extra)
     msg, finish, u = resp.choices[0].message, resp.choices[0].finish_reason, resp.usage
     log.info("[LLM] %.1fs | tokens in=%s out=%s | finish=%s", time.time() - t0, u.prompt_tokens, u.completion_tokens, finish)
     if finish == "length":
@@ -275,6 +403,54 @@ def use_before_definition(code):
     return problems
 
 
+def _str(node, consts):
+    """Best-effort string value of an expression; '*' for the parts only known at run time."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return consts.get(node.id)
+    if isinstance(node, ast.JoinedStr):  # f"models/ckpt_{epoch:02d}.keras"
+        return "".join(v.value if isinstance(v, ast.Constant) else _str(v.value, consts) or "*" for v in node.values)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _str(node.left, consts), _str(node.right, consts)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "join" and node.args:  # os.path.join
+        parts = [_str(a, consts) for a in node.args]
+        return "/".join(parts) if all(parts) else None
+    return None
+
+
+def model_paths(code):
+    """Files the script saves a full model to (ModelCheckpoint / model.save / save_model), as glob patterns.
+    This is what the grader is synced to, so a renamed checkpoint is graded instead of reported missing."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    consts, paths = {}, []
+    for n in ast.walk(tree):  # MODEL_PATH = "models/x.keras" -> ModelCheckpoint(MODEL_PATH)
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            value = _str(n.value, consts)
+            if value is not None:
+                consts[n.targets[0].id] = value
+    for n in ast.walk(tree):
+        name = getattr(n, "func", None) and (getattr(n.func, "attr", None) or getattr(n.func, "id", ""))
+        if name not in ("ModelCheckpoint", "save", "save_model") or any(
+                k.arg == "save_weights_only" and getattr(k.value, "value", False) is True for k in n.keywords):
+            continue
+        for arg in n.args + [k.value for k in n.keywords]:
+            s = _str(arg, consts)
+            if s and s.endswith((".keras", ".h5")) and not s.endswith(".weights.h5"):
+                s = re.sub(r"\{[^}]*\}", "*", s)  # "{epoch:02d}" in a plain string is filled in by Keras
+                if s not in paths:
+                    paths.append(s)
+    return paths
+
+
+# Backbones with their own pixel preprocessing: they take raw 0..255 and need no Rescaling in front.
+SELF_RESCALING = re.compile(r"EfficientNet|ConvNeXt")
+
+
 def check_code(code):
     """Cheap static checks before we spend minutes running it. Returns a list of problems."""
     problems = []
@@ -288,16 +464,20 @@ def check_code(code):
         problems.append("no Conv2D layer and no tf.keras.applications backbone - not a CNN")
     if "cifar10_split.npz" not in code:
         problems.append("does not load data/cifar10_split.npz")
-    if "ModelCheckpoint" not in code:
-        problems.append("no ModelCheckpoint callback - model must be saved during training")
-    elif "models/cifar10_cnn.keras" not in code:
-        paths = re.findall(r"ModelCheckpoint\(\s*[\"']([^\"']+)[\"']", code) or re.findall(r"[\w/]+\.keras", code)
-        problems.append('the checkpoint path must be EXACTLY "models/cifar10_cnn.keras" - the grader reads only that '
-                        "file and ignores any other name" + (f" (yours: {', '.join(paths)})" if paths else ""))
+    if not model_paths(code):
+        if re.search(r"save_weights_only\s*=\s*True", code):
+            problems.append("save_weights_only=True saves weights, not a model the grader can load - remove it and "
+                            "save the full model to a .keras file")
+        elif not re.search(r"ModelCheckpoint\(|\.save\(|save_model\(", code):  # dynamic path: grader falls back
+            problems.append('the script never saves the model - add tf.keras.callbacks.ModelCheckpoint('
+                            '"models/cifar10_cnn.keras", monitor="val_accuracy", save_best_only=True)')
     if re.search(r"validation_data\s*=\s*\(\s*x_test", code):
         problems.append("uses the TEST set as validation_data - use validation_data=(x_val, y_val) (test leakage)")
-    if "Rescaling(" not in code and "Normalization(" not in code:
+    if "Rescaling(" not in code and "Normalization(" not in code and not SELF_RESCALING.search(code):
         problems.append("no Rescaling / Normalization layer inside the model - it would receive raw 0..255 pixels")
+    if SELF_RESCALING.search(code) and "Rescaling(" in code and "include_preprocessing=False" not in code:
+        problems.append("EfficientNet / ConvNeXt backbones rescale raw 0..255 pixels themselves: remove the "
+                        "Rescaling layer, otherwise the backbone sees pixels divided by 255 twice")
     # "/ 255" anywhere except inside a Rescaling(...) / preprocessing call = pixels scaled outside the model too
     outside = [l.strip() for l in re.sub(r"(Rescaling|Normalization|Resizing)\([^)]*\)", "", code).splitlines()
                if re.search(r"/\s*255", l)]
@@ -404,49 +584,76 @@ def parse_accuracy(lines):
 
 # ---------------------------------------------------------------- grader
 
-# Runs in a subprocess: keeps TensorFlow (RAM, GPU memory) out of the harness process.
-GRADER = r"""
-import json, sys, numpy as np, tensorflow as tf
+# Written to generated/grader_N.py for every script by sync_grader(), run in a subprocess (keeps TensorFlow's RAM
+# and GPU memory out of the harness). The harness writes it, never the LLM: the measurement stays independent,
+# only WHERE the model lives and WHICH helpers it needs to load follow the script.
+GRADER = r'''"""Grader for one generated training script (written by the harness, not by the LLM)."""
+import glob, json, os, sys
+import numpy as np
+import tensorflow as tf
+
+CFG = __CONFIG__
+
+
+def find_model():
+    """Newest file the script declared; if none exists, any model left in models/ (a path built at run time)."""
+    for patterns in (CFG["paths"], ["models/*.keras", "models/*.h5"]):
+        found = [p for pat in patterns for p in glob.glob(pat) if not os.path.basename(p).startswith("best.")]
+        if found:
+            return max(found, key=os.path.getmtime)
+    raise FileNotFoundError(f"the script saved no model file (looked for {CFG['paths'] or 'models/*.keras'})")
+
+
 def score(m, x, y):
-    s = m.predict(x.astype("float32"), batch_size=500, verbose=0)
+    s = np.asarray(m.predict(x.astype("float32"), batch_size=200, verbose=0))
     if s.shape != (len(x), 10):
         raise ValueError(f"model output shape {s.shape}, expected ({len(x)}, 10)")
     return float(np.mean(s.argmax(1) == y))
+
+
 try:
-    m = tf.keras.models.load_model(sys.argv[1])
-    d = np.load(sys.argv[2])
-    print("GRADE=" + json.dumps({"acc": score(m, d["x_test"], d["y_test"]),
+    ns = {}
+    try:  # the script's own imports, functions and classes, so custom layers / losses in the file can load
+        exec(CFG["prelude"], ns)
+    except Exception as e:
+        print("prelude failed:", e)
+    path = find_model()
+    # compile=False: a custom loss or optimizer in the checkpoint must not stop us from measuring the network
+    m = tf.keras.models.load_model(path, custom_objects={k: v for k, v in ns.items() if callable(v)},
+                                   compile=False, safe_mode=False)
+    d = np.load(sys.argv[1])
+    print("GRADE=" + json.dumps({"file": path,
+                                 "acc": score(m, d["x_test"], d["y_test"]),
                                  "train_acc": score(m, d["x_train"][:10000], d["y_train"][:10000]),
                                  # diagnostic probe: does the model secretly expect pixels already divided by 255?
                                  "probe_acc": score(m, d["x_test"][:2000] / 255.0, d["y_test"][:2000]),
                                  "params": int(m.count_params())}))
 except Exception as e:
     print("GRADE=" + json.dumps({"error": f"{type(e).__name__}: {e}"}))
-"""
+'''
 
 
-def verify_model():
-    """Returns dict with acc, train_acc, probe_acc, params - or error.
-    If the script saved under a different name, grade that file anyway (a whole training run is too expensive to
-    throw away over a filename) and report it, so the feedback can tell the model to fix the path."""
-    target, wrong_path = MODEL_FILE, None
-    if not target.exists():
-        others = [f for f in MODEL_FILE.parent.glob("*.keras") if f != BEST_MODEL]
-        if len(others) != 1:
-            return {"error": "no model file at models/cifar10_cnn.keras"
-                             + (f" (found instead: {', '.join(f.name for f in others)})" if others else "")}
-        target, wrong_path = others[0], others[0].name
-        log.warning("[VERIFY] models/cifar10_cnn.keras is missing; grading %s instead", wrong_path)
-    out = subprocess.run([sys.executable, "-c", GRADER, str(target), str(DATA_FILE)], capture_output=True,
+def sync_grader(attempt, code):
+    """Rewrite the grader for THIS script: it grades the file the script actually saves (whatever it is called,
+    epoch-numbered names included) and can load the script's own helpers. Returns (grader path, save paths)."""
+    paths = model_paths(code)
+    tree = ast.parse(code)
+    prelude = "\n".join(ast.get_source_segment(code, n) for n in tree.body
+                        if isinstance(n, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef)))
+    grader = GEN_DIR / f"grader_{attempt}.py"
+    grader.write_text(GRADER.replace("__CONFIG__", repr({"paths": paths, "prelude": prelude})), encoding="utf-8")
+    log.info("[GRADER] wrote %s -> grades %s", grader.relative_to(ROOT).as_posix(),
+             ", ".join(paths) or "newest model in models/ (no literal save path in the script)")
+    return grader, paths
+
+
+def verify_model(grader):
+    """Runs the synced grader. Returns dict with file, acc, train_acc, probe_acc, params - or error."""
+    out = subprocess.run([sys.executable, str(grader), str(DATA_FILE)], cwd=ROOT, capture_output=True,
                          text=True, encoding="utf-8", errors="replace",
-                         env={**TF_ENV, "TF_CPP_MIN_LOG_LEVEL": "3"}, timeout=600).stdout
+                         env={**TF_ENV, "TF_CPP_MIN_LOG_LEVEL": "3"}, timeout=900).stdout
     m = re.search(r"GRADE=(.*)", out)
-    g = json.loads(m.group(1)) if m else {"error": "grader crashed: " + out[-500:]}
-    if "error" not in g:
-        g["graded_file"] = str(target)  # may not be MODEL_FILE: see wrong_path above
-    if wrong_path:
-        g["wrong_path"] = wrong_path
-    return g
+    return json.loads(m.group(1)) if m else {"error": "grader crashed: " + out[-500:]}
 
 # ---------------------------------------------------------------- diagnosis + feedback
 
@@ -504,27 +711,28 @@ def diagnose(r):
     return None, None
 
 
-AUG = re.compile(r"Random(Flip|Translation|Rotation|Crop|Zoom|Contrast)")
+AUG = re.compile(r"Random(Flip|Translation|Rotation|Crop|Zoom|Contrast)|random_(crop|flip)")
 
-# Techniques the harness can recognise in a script. The ledger of what has and has not been tried goes into every
-# feedback message: a small model otherwise keeps re-tuning the same two knobs.
+# Techniques the harness can recognise in a script, by USE rather than by mention: the reference script defines
+# res_block() and mixup() whether or not they are used. Feeds the "not tried yet" list and the next-move choice.
 TECHNIQUES = {
     "data augmentation": AUG,
-    "cutout/mixup/cutmix": re.compile(r"cutout|mixup|cutmix", re.I),
+    "cutout": re.compile(r"CUTOUT\s*=\s*[1-9]|cutout\(", re.I),
+    "mixup / cutmix": re.compile(r"MIXUP\s*=\s*(0?\.0*[1-9]|[1-9])|cutmix", re.I),
     "batch normalization": re.compile(r"BatchNormalization"),
     "dropout": re.compile(r"Dropout\("),
     "weight decay / L2": re.compile(r"weight_decay|regularizers\.l2|kernel_regularizer"),
-    "label smoothing": re.compile(r"label_smoothing"),
-    "residual / skip connections": re.compile(r"layers\.Add|Add\(\)|add\(\[|residual|ResNet", re.I),
-    "pretrained backbone": re.compile(r"applications\.|weights\s*=\s*[\"']imagenet[\"']"),
+    "label smoothing": re.compile(r"label_smoothing\s*=\s*(0?\.0*[1-9]|LABEL)"),
+    "residual / skip connections": re.compile(r"=\s*\w*(res_block|residual|identity_block|bottleneck)\w*\(|ResNet",
+                                              re.I),
+    "pretrained backbone": re.compile(r"weights\s*=\s*[\"']imagenet[\"']"),
+    "high resolution (224px)": re.compile(r"IMG\s*=\s*2[2-9]\d|Resizing\(\s*2[2-9]\d"),
     "LR schedule": re.compile(r"CosineDecay|LearningRateScheduler|ReduceLROnPlateau|ExponentialDecay|PiecewiseConstant|warmup|OneCycle", re.I),
     "SGD + momentum": re.compile(r"SGD\("),
     "AdamW": re.compile(r"AdamW"),
     "mixed precision": re.compile(r"mixed_float16|set_global_policy"),
     "tf.data pipeline": re.compile(r"tf\.data|from_tensor_slices"),
-    "global average pooling": re.compile(r"GlobalAveragePooling2D"),
-    "early stopping": re.compile(r"EarlyStopping"),
-    "separable / dilated conv": re.compile(r"SeparableConv2D|dilation_rate"),
+    "global average pooling": re.compile(r"GlobalAveragePooling2D|pooling\s*=\s*[\"']avg"),
 }
 
 
@@ -533,14 +741,52 @@ def techniques(code):
     return {name for name, rx in TECHNIQUES.items() if rx.search(code or "")}
 
 
+# The harness does the research planning, the LLM the implementation: a 7B model given a list of 14 untried
+# techniques picks the easiest (RandomFlip) every time; given ONE concrete experiment it implements it.
+# (technique, applies to the best script's techniques, instruction), in order of expected gain on this task.
+MOVES = [
+    ("pretrained backbone", lambda have: True,
+     "Replace build_model() with the pretrained EfficientNetV2B0 pattern from BUILDING BLOCKS (IMG = 160, no "
+     "Rescaling layer) and set LR = 5e-4, BATCH = 64, EPOCHS = 12. Keep the data pipeline, callbacks and final "
+     "evaluation exactly as they are. Fine-tuning an ImageNet backbone is the most reliable way past 0.93."),
+    ("residual / skip connections", lambda have: "pretrained backbone" not in have,
+     "Replace build_model() with the ResNet-18-style network from BUILDING BLOCKS (res_block, stages 64-128-256-512, "
+     "two blocks per stage) and set EPOCHS as high as the measured seconds per epoch allow."),
+    ("high resolution (224px)", lambda have: "pretrained backbone" in have,
+     "Keep the pretrained backbone and raise IMG to 224 (and input_shape with it), BATCH = 64. An epoch takes about "
+     "2x longer: set EPOCHS from the measured seconds per epoch so the run stays inside the time limit."),
+    ("mixup / cutmix", lambda have: True,
+     "Keep the network. Set MIXUP = 0.2 (keep CUTOUT) and train about 30% more epochs if time allows: mixup "
+     "regularises, so it needs longer training to pay off."),
+]
+
+
+def next_move(best_code, asked):
+    """First move the best script does not use yet and that has not been asked for twice. (name, text) or Nones."""
+    have = techniques(best_code)
+    for name, applies, how in MOVES:
+        if name not in have and applies(have) and asked.get(name, 0) < 2:
+            return name, how
+    return None, None
+
+
+def epoch_seconds(lines):
+    """Median seconds per epoch from Keras verbose=2 lines like '351/351 - 42s - 120ms/step - accuracy: ...'."""
+    secs = sorted(int(m.group(1)) for l in lines if (m := re.match(r"\d+/\d+ - (\d+)s ", l)))
+    return secs[len(secs) // 2] if secs else None
+
+
 def budget_note(r):
-    """Tell the model how much of the compute budget it left on the table."""
-    used = r.get("secs", 0) / 60
+    """Seconds per epoch and how much of the compute budget was left on the table: a 7B model cannot work out
+    EPOCHS from 'use the budget', it can from 'one epoch = 40 s, the budget fits 57 epochs'."""
+    used, sec, note = r.get("secs", 0) / 60, epoch_seconds(r.get("lines", [])), ""
+    if sec:
+        note += (f"\nTiming: one epoch took about {sec}s, so {TRAIN_BUDGET_MIN - 5} minutes fit about "
+                 f"{(TRAIN_BUDGET_MIN - 5) * 60 // sec} epochs of this network.")
     if 0 < used < TRAIN_BUDGET_MIN / 3:
-        return (f"\nCompute: training used only {used:.1f} of the {TRAIN_BUDGET_MIN} minute budget, so roughly "
-                f"{TRAIN_BUDGET_MIN / used:.0f}x more compute is available for a bigger network or longer training "
-                f"(more epochs, larger EarlyStopping patience).")
-    return ""
+        note += (f"\nCompute: training used only {used:.1f} of the {TRAIN_BUDGET_MIN} minute budget, so roughly "
+                 f"{TRAIN_BUDGET_MIN / used:.0f}x more compute is available for a bigger network or longer training.")
+    return note
 
 
 def feedback(r):
@@ -576,9 +822,10 @@ def feedback(r):
         body = f"Your script crashed with exit code {r.get('exit_code')}. Traceback:\n```\n{tail}\n```"
     elif r.get("eval_error"):
         status = "grader failed: " + r["eval_error"][:120]
-        body = (f"The grader could not use the saved model: {r['eval_error']}\nThe saved model must load with "
-                f"tf.keras.models.load_model, accept raw 0..255 images of shape (N, 32, 32, 3) and output 10 scores.\n"
-                f"Epochs:\n```\n{curve}\n```")
+        body = (f"The grader could not use the model your script saved: {r['eval_error']}\nThe grader looked for "
+                f"{', '.join(r.get('save_paths') or ['models/*.keras'])}. The saved file must be a full model "
+                f"(not weights only) that loads with tf.keras.models.load_model, accepts raw 0..255 images of shape "
+                f"(N, 32, 32, 3) and outputs 10 scores.\nEpochs:\n```\n{curve}\n```")
     elif r.get("gap", 0) > MAX_GAP and acc >= TARGET:
         tr = r["train_acc"]
         status = f"overfit at target (train {tr:.3f} / test {acc:.3f})"
@@ -608,10 +855,10 @@ def feedback(r):
                          f"strong enough. A bigger jump is needed - a different architecture family or a pretrained "
                          f"backbone, not another small tweak.")
         body = head + f"\nEpochs:\n```\n{curve}\n```" + budget_note(r)
-    if r.get("wrong_path"):
-        body = (f"WRONG CHECKPOINT PATH: you saved to models/{r['wrong_path']}, but the grader reads ONLY "
-                f"models/cifar10_cnn.keras. It graded your file this time; next time that is a failed attempt. "
-                f'Use ModelCheckpoint("models/cifar10_cnn.keras", ...) exactly.\n\n') + body
+    asked = r.get("directive")
+    if asked and r.get("code") and asked not in techniques(r["code"]):
+        body = (f"NOTE: the experiment you were asked to run was '{asked}', but your script does not contain it. "
+                f"Write the code the experiment calls for.\n\n") + body
     if "augment" in r.get("plan", "").lower() and r.get("code") and not AUG.search(r["code"]):
         body = ("NOTE: your PLAN said you would add data augmentation, but the script contains NO augmentation layer "
                 "(RandomFlip / RandomTranslation / ...). Write the code your plan describes.\n\n") + body
@@ -644,20 +891,22 @@ def attempt_once(attempt, messages, temperature, seen):
         log.warning("[CHECK] script is IDENTICAL to attempt %d - not running it", seen[key])
         return reply, r
     seen[key] = attempt
-    for stale in MODEL_FILE.parent.glob("*.keras"):  # no file from an earlier attempt may be graded
-        if stale != BEST_MODEL:
-            stale.unlink()
+    grader, r["save_paths"] = sync_grader(attempt, code)
+    for pattern in r["save_paths"] + ["models/*.keras", "models/*.h5"]:  # no earlier attempt's file may be graded
+        for stale in map(Path, glob.glob(str(ROOT / pattern))):
+            if stale.is_file() and not stale.name.startswith("best.") and ROOT.resolve() in stale.resolve().parents:
+                stale.unlink()
     r["exit_code"], r["lines"], r["secs"], r["timed_out"] = run_script(path)
     claimed = parse_accuracy(r["lines"])
-    log.info("[VERIFY] grading %s on 10k test + first 10k train images", MODEL_FILE.relative_to(ROOT).as_posix())
-    g = verify_model()
+    log.info("[VERIFY] %s: grading on 10k test + first 10k train images", grader.relative_to(ROOT).as_posix())
+    g = verify_model(grader)
     if g.get("error"):
         r["eval_error"] = g["error"]
         log.warning("[VERIFY] %s", r["eval_error"])
         return reply, r
     r["acc"], r["train_acc"], r["probe_acc"], r["claimed"] = g["acc"], g["train_acc"], g["probe_acc"], claimed
-    r["gap"], r["params"], r["wrong_path"] = r["train_acc"] - r["acc"], g["params"], g.get("wrong_path")
-    r["graded_file"] = g["graded_file"]
+    r["gap"], r["params"], r["graded_file"] = r["train_acc"] - r["acc"], g["params"], ROOT / g["file"]
+    log.info("[VERIFY] graded %s", g["file"])
     log.info("[METRIC] test_acc=%.4f | train_acc=%.4f | gap=%.4f (max %.2f) | claimed=%s | probe(/255)=%.4f | "
              "params=%s | train=%.1f min | exit=%s", r["acc"], r["train_acc"], r["gap"], MAX_GAP,
              f"{claimed:.4f}" if claimed is not None else "none", r["probe_acc"], f"{g['params']:,}",
@@ -680,6 +929,7 @@ def main():
     messages = base
     results, lessons, seen, t_start = [], [], {}, time.time()
     best_acc, best_attempt, best_reply, stall = -1.0, None, None, 0  # stall = experiments in a row without a new best
+    best_code, asked, directive, save_paths = "", {}, None, None  # asked = how often each MOVE was requested
     tried, errors = set(), {}   # techniques seen anywhere; how often each crash message has been seen
     experiments = attempt = fails = 0  # experiments = attempts that produced a measured accuracy
     broken_last = False         # last attempt crashed or was rejected: ask for precision, not creativity
@@ -708,6 +958,10 @@ def main():
             continue
 
         acc = r.get("acc")
+        r["directive"] = directive
+        if r.get("save_paths") is not None and r["save_paths"] != save_paths:
+            log.info("[GRADER] save path changed: %s -> %s (grader updated to match)", save_paths, r["save_paths"])
+            save_paths = r["save_paths"]
         used = techniques(r.get("code", ""))
         tried |= used
         broken_last = acc is None
@@ -715,8 +969,8 @@ def main():
         if acc is not None:
             experiments += 1
         if acc is not None and acc > best_acc + 0.005:
-            best_acc, best_attempt, best_reply, stall = acc, attempt, reply, 0
-            shutil.copy(r["graded_file"], BEST_MODEL)
+            best_acc, best_attempt, best_reply, best_code, stall = acc, attempt, reply, r["code"], 0
+            shutil.copy(r["graded_file"], BEST_MODEL.with_suffix(r["graded_file"].suffix))
             (GEN_DIR / "best.py").write_text(r["code"], encoding="utf-8")
             log.info("[DECISION] new best: attempt %d test=%.4f -> saved %s + generated/best.py",
                      attempt, acc, BEST_MODEL.relative_to(ROOT).as_posix())
@@ -751,7 +1005,13 @@ def main():
                            f"Go back to the last script that actually trained" +
                            (f" (attempt {best_attempt}, test {best_acc:.4f}), shown above, " if best_attempt else " ") +
                            f"and make ONE small, safe change to it instead.\n\n") + fix_msg
-        if stall >= 2 and best_attempt:
+        # After a measured result the harness picks the next experiment; after a crash the job is the repair.
+        directive, how = next_move(best_code, asked) if acc is not None else (None, None)
+        if directive:
+            asked[directive] = asked.get(directive, 0) + 1
+            log.info("[DECISION] next experiment: %s (request %d)", directive, asked[directive])
+            fix_msg = f"NEXT EXPERIMENT (chosen by the harness from all results so far): {how}\n\n" + fix_msg
+        elif stall >= 2 and best_attempt:
             log.warning("[DECISION] PLATEAU: no new best for %d attempts (best %.4f, attempt %d)",
                         stall, best_acc, best_attempt)
             fix_msg = (f"PLATEAU: the best test accuracy so far is {best_acc:.4f} (attempt {best_attempt}) and the "
@@ -763,7 +1023,7 @@ def main():
         history = "\n".join(f"- {l}" for l in lessons)
         fix_msg += f"\n\nResults of ALL attempts so far (do not repeat these failures):\n{history}"
         untried = sorted(set(TECHNIQUES) - tried)
-        if untried:
+        if untried and not directive and acc is not None:
             fix_msg += ("\n\nTechniques NOT tried in any attempt yet - the accuracy you are missing is most likely in "
                         "this list:\n- " + "\n- ".join(untried))
         # Anchor on the best script when the last attempt was worse, so the search does not drift downhill.
@@ -815,11 +1075,26 @@ def selftest():
                   "n = tf.keras.layers.Normalization()\nr = tf.keras.layers.Resizing(96, 96)\n"
                   "b = tf.keras.applications.EfficientNetB0(weights='imagenet')")
     assert check_code(pretrained) == [], check_code(pretrained)
-    # the real Qwen bug: right callback, wrong filename -> rejected before training, with the name quoted back
-    wrong = check_code(ok.replace("cifar10_cnn.keras", "cifar10_resnet.keras"))
-    assert len(wrong) == 1 and "EXACTLY" in wrong[0] and "models/cifar10_resnet.keras" in wrong[0], wrong
-    assert feedback({"problems": [], "exit_code": 0, "acc": 0.7, "train_acc": 0.8, "gap": 0.1,
-                     "wrong_path": "cifar10_resnet.keras"})[1].startswith("WRONG CHECKPOINT PATH")
+    # the real Qwen case: a renamed checkpoint is no longer a failed attempt - the grader follows the script
+    assert check_code(ok.replace("cifar10_cnn.keras", "cifar10_resnet.keras")) == []
+    assert model_paths(ok.replace("cifar10_cnn.keras", "cifar10_resnet.keras")) == ["models/cifar10_resnet.keras"]
+    assert model_paths("P = 'models/a.keras'\ncb = ModelCheckpoint(P)\nmodel.save('models/final.h5')") == [
+        "models/a.keras", "models/final.h5"]
+    assert model_paths("ModelCheckpoint(f'models/ep_{epoch:02d}.keras')\nModelCheckpoint('m/{epoch}.keras')") == [
+        "models/ep_*.keras", "m/*.keras"]
+    assert model_paths("D = 'models'\nsave_model(m, os.path.join(D, 'x.keras'))\nnp.save('a.npy', x)") == [
+        "models/x.keras"]
+    assert model_paths("ModelCheckpoint('w.weights.h5', save_weights_only=True)") == []
+    weights = ok.replace("ModelCheckpoint('models/cifar10_cnn.keras')",
+                         "ModelCheckpoint('models/w.keras', save_weights_only=True)")
+    assert any("save_weights_only" in p for p in check_code(weights)), check_code(weights)
+    assert check_code(SCAFFOLD) == [], check_code(SCAFFOLD)
+    assert model_paths(SCAFFOLD) == ["models/cifar10_cnn.keras"]
+    # EfficientNetV2 rescales itself: no Rescaling needed, and a Rescaling in front of it is rejected
+    effnet = SCAFFOLD.replace("layers.Rescaling(1.0 / 255)(inputs)", "layers.Resizing(160, 160)(inputs)") + \
+        "\nbase = tf.keras.applications.EfficientNetV2B0(include_top=False, weights='imagenet')"
+    assert check_code(effnet) == [], check_code(effnet)
+    assert any("twice" in p for p in check_code(effnet + "\nlayers.Rescaling(1.0 / 255)"))
     # the exact bug from the Qwen log: scaled outside the model AND by the Rescaling layer
     bad = check_code(ok + "\nx_train = x_train.astype(np.float32) / 255.0\nx_val = x_val/255")
     assert len(bad) == 1 and "OUTSIDE the model" in bad[0] and "x_val = x_val/255" in bad[0], bad
@@ -857,6 +1132,24 @@ def selftest():
         "data augmentation", "batch normalization", "LR schedule"}
     assert techniques("applications.ResNet50(weights='imagenet')") >= {"pretrained backbone"}
     assert techniques("x = 1") == set()
+    # the reference script DEFINES res_block and mixup; only their use counts
+    base_t = techniques(SCAFFOLD)
+    assert {"cutout", "label smoothing", "AdamW", "mixed precision", "data augmentation"} <= base_t, base_t
+    assert not base_t & {"residual / skip connections", "mixup / cutmix", "pretrained backbone"}, base_t
+    assert "residual / skip connections" in techniques(SCAFFOLD + "\n    x = res_block(x, 64)")
+    assert "mixup / cutmix" in techniques(SCAFFOLD.replace("MIXUP = 0.0", "MIXUP = 0.2"))
+    assert "residual / skip connections" not in techniques("x = layers.Rescaling(1/255)(inputs)\nx = Rescaling(2)")
+    # the harness picks the research direction: pretrained first, ResNet only while not pretrained, then 224px
+    assert next_move(SCAFFOLD, {})[0] == "pretrained backbone"
+    assert next_move(SCAFFOLD, {"pretrained backbone": 2})[0] == "residual / skip connections"
+    assert next_move(effnet, {})[0] == "high resolution (224px)"
+    assert next_move(effnet.replace("160", "224") + "\nMIXUP = 0.2", {}) == (None, None)
+    b = feedback({**{"problems": [], "exit_code": 0, "acc": 0.84, "train_acc": 0.86, "gap": 0.02, "secs": 600},
+                  "directive": "pretrained backbone", "code": SCAFFOLD})[1]
+    assert b.startswith("NOTE: the experiment you were asked to run was 'pretrained backbone'"), b[:80]
+    assert epoch_seconds(["Epoch 1/3", "351/351 - 50s - 1ms/step - accuracy: 0.4", "Epoch 2/3",
+                          "351/351 - 41s - 1ms/step - accuracy: 0.5", "351/351 - 40s - x"]) == 41
+    assert "fit about 58 epochs" in budget_note({"secs": 2000, "lines": ["351/351 - 41s - x"]})
 
     # the crash patterns from the qwen2.5-coder run, caught before any training
     assert any(p.startswith("'model' is used on line 3 before it is defined") for p in use_before_definition(
